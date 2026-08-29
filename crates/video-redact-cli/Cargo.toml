@@ -1,0 +1,21 @@
+[package]
+name = "video-redact-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "video-redact"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["dep:video-redact-cuda", "video-redact-cuda/cuda"]
+
+[dependencies]
+video-redact-core.workspace = true
+video-redact-cuda = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+

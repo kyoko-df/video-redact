@@ -1,0 +1,23 @@
+[package]
+name = "video-redact-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+video-redact-core.workspace = true
+cudarc = { version = "0.19.9", optional = true, default-features = false, features = [
+    "cuda-12080",
+    "driver",
+    "dynamic-loading",
+    "nvrtc",
+    "std",
+] }
+
+[lints]
+workspace = true
+
