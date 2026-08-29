@@ -99,6 +99,12 @@ impl RgbFrame {
     pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.data
     }
+
+    /// Returns the owned tightly packed RGB24 buffer.
+    #[must_use]
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -6,7 +6,8 @@
 
 - `video-redact-core`：RGB24 帧、ROI、CPU 参考实现和后端接口。
 - `video-redact-cuda`：通过 `cudarc` + NVRTC 加载真实 CUDA ROI 马赛克 kernel。
-- `video-redact-cli`：生成测试图并通过 CPU 或 CUDA 后端脱敏。
+- `video-redact-ffmpeg`：通过 FFmpeg 解码 RGB24 帧、逐帧脱敏并编码 H.264 MP4。
+- `video-redact-cli`：运行测试图或 MP4 文件脱敏流水线。
 
 ## 快速开始
 
@@ -16,6 +17,20 @@
 cargo run -p video-redact-cli -- demo --output demo.ppm --backend cpu
 cargo test --workspace
 ```
+
+处理一条 MP4（需要 `ffmpeg` 和 `ffprobe` 在 `PATH` 中）：
+
+```bash
+cargo run -p video-redact-cli -- redact \
+  --input input.mp4 \
+  --output redacted.mp4 \
+  --roi 120,80,420,320 \
+  --roi 700,100,920,260 \
+  --block-size 16 \
+  --backend cpu
+```
+
+ROI 使用半开区间 `left,top,right,bottom`，会应用到视频的每一帧；超出画面的部分会自动裁剪。重复执行并替换已有输出时添加 `--overwrite`。
 
 在装有 NVIDIA 驱动及 CUDA 12.8 runtime/toolkit 的 Linux 主机上验证 CUDA 路径：
 
@@ -31,6 +46,7 @@ CUDA 依赖采用动态加载，因此编译主机不需要静态链接 CUDA；�
 ```text
 video-redact info
 video-redact demo [--output demo.ppm] [--backend cpu|cuda]
+video-redact redact --input PATH --output PATH --roi L,T,R,B [OPTIONS]
 ```
 
 `demo` 会生成一张 RGB 测试图，并对两个矩形区域应用马赛克。PPM 可以被多数图像工具打开，也可以使用 FFmpeg 转换：
@@ -39,13 +55,15 @@ video-redact demo [--output demo.ppm] [--backend cpu|cuda]
 ffmpeg -i demo.ppm demo.png
 ```
 
+`redact` 当前处理第一条视频流，用输入平均帧率驱动恒定帧率编码，视频编码器为 `libx264`、像素格式为 `yuv420p`；输入音频流直接复制到输出。可通过 `VIDEO_REDACT_FFMPEG` 和 `VIDEO_REDACT_FFPROBE` 环境变量指定可执行文件路径。
+
+这是有意保留的第一条正确性基线：FFmpeg 与脱敏后端之间使用 RGB24 管道，因此 CPU 和现有 CUDA 实现都能工作，但仍有主机内存拷贝，且可变帧率输入会被归一化。后续 NVDEC/NVENC 路径将替换该传输层。
+
 ## 近期路线
 
-1. 接入 FFmpeg，完成 MP4 demux/decode/encode。
-2. 将 CPU 帧替换为 NVDEC 产生的 GPU frame，消除主机往返拷贝。
-3. 接入 ONNX/TensorRT 人脸及车牌检测模型。
-4. 增加目标跟踪、低置信度审核和 JSON 审计报告。
-5. 支持 RTSP、多路并发、Prometheus 指标和容器部署。
+1. 将 RGB24 管道替换为 NVDEC/NVENC GPU frame，消除主机往返拷贝。
+2. 接入 ONNX/TensorRT 人脸及车牌检测模型。
+3. 增加目标跟踪、低置信度审核和 JSON 审计报告。
+4. 支持 RTSP、多路并发、Prometheus 指标和容器部署。
 
 详细边界与模块关系见 [`docs/architecture.md`](docs/architecture.md)。
-

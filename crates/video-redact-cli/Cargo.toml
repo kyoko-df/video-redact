@@ -15,7 +15,7 @@ cuda = ["dep:video-redact-cuda", "video-redact-cuda/cuda"]
 [dependencies]
 video-redact-core.workspace = true
 video-redact-cuda = { workspace = true, optional = true }
+video-redact-ffmpeg.workspace = true
 
 [lints]
 workspace = true
-

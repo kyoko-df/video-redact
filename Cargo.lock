@@ -33,6 +33,7 @@ version = "0.1.0"
 dependencies = [
  "video-redact-core",
  "video-redact-cuda",
+ "video-redact-ffmpeg",
 ]
 
 [[package]]
@@ -44,6 +45,13 @@ name = "video-redact-cuda"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "video-redact-core",
+]
+
+[[package]]
+name = "video-redact-ffmpeg"
+version = "0.1.0"
+dependencies = [
  "video-redact-core",
 ]
 

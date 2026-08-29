@@ -14,9 +14,24 @@ file / RTSP
     -> file / HLS / RTSP
 ```
 
+当前已落地的第一条文件流水线：
+
+```text
+MP4 file
+    -> FFmpeg demux + software decode
+    -> RGB24 stdout pipe
+    -> CPU/CUDA Redactor (static ROI mosaic)
+    -> RGB24 stdin pipe
+    -> FFmpeg libx264 encode + input audio stream copy
+    -> MP4 file
+```
+
+该路径优先建立端到端正确性、进程失败处理和可测试的模块边界。它按输入平均帧率输出恒定帧率视频；可变帧率时间戳、零拷贝和硬件编解码属于下一阶段。
+
 ## 设计边界
 
 - `video-redact-core` 不依赖 CUDA 或 FFmpeg，保存领域类型和可测试的 CPU 参考算法。
+- `video-redact-ffmpeg` 管理探测、解码/编码子进程和逐帧调度，不包含具体脱敏策略。
 - `video-redact-cuda` 只处理已经解码的帧；当前用 RGB24 验证 kernel，接入 NVDEC 后扩展为 NV12/P010。
 - `video-redact-cli` 只负责参数、I/O 和后端装配，业务策略不放进 CLI。
 - 检测器和跟踪器将作为独立 trait 接入，避免把 TensorRT 生命周期耦合到视频解码器。
@@ -34,4 +49,3 @@ file / RTSP
 - 性能：分别记录 decode、preprocess、inference、redact、encode 耗时。
 - 稳定性：输入损坏、流中断或单路 OOM 不应拖垮其他任务。
 - 隐私：保存低置信度检测记录，并支持人工复核输出。
-
