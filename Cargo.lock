@@ -45,6 +45,7 @@ name = "video-redact-cuda"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "libloading",
  "video-redact-core",
 ]
 

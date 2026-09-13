@@ -37,9 +37,13 @@ ROI 使用半开区间 `left,top,right,bottom`，会应用到视频的每一帧�
 ```bash
 cargo run -p video-redact-cli --features cuda -- \
   demo --output demo.ppm --backend cuda
+
+VIDEO_REDACT_REQUIRE_CUDA=1 \
+  cargo test -p video-redact-cuda --features cuda
 ```
 
 CUDA 依赖采用动态加载，因此编译主机不需要静态链接 CUDA；运行 CUDA 路径仍需要 NVIDIA GPU、驱动以及 NVRTC 动态库。若目标机器使用不同 CUDA 版本，请调整 `crates/video-redact-cuda/Cargo.toml` 中的 `cuda-12080` feature。
+CUDA 测试会逐像素比对 CPU 参考实现，覆盖不完整马赛克块、裁剪及重叠 ROI；没有设置 `VIDEO_REDACT_REQUIRE_CUDA` 时，无 CUDA 的开发机会跳过真机比对。
 
 ## CLI
 
