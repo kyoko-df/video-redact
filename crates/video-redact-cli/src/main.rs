@@ -169,6 +169,11 @@ fn print_pipeline_report(options: &PipelineOptions, report: &PipelineReport, bac
         report.video.height,
         report.video.frame_rate,
     );
+    let timings = &report.timings;
+    println!(
+        "timings: probe {:.2?}, decode {:.2?}, redact {:.2?}, encode {:.2?}, total {:.2?}",
+        timings.probe, timings.decode, timings.redact, timings.encode, report.elapsed,
+    );
 }
 
 #[cfg(feature = "cuda")]

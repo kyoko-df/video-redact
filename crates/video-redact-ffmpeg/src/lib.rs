@@ -12,6 +12,7 @@ use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use video_redact_core::{Rect, RedactError, RedactionEffect, Redactor, RgbFrame};
 
@@ -51,6 +52,32 @@ impl Display for FrameRate {
 pub struct PipelineReport {
     pub frames_processed: u64,
     pub video: VideoInfo,
+    /// Wall-clock time accumulated in each pipeline stage.
+    pub timings: StageTimings,
+    /// Total wall-clock time of the run, including probing and process setup.
+    pub elapsed: Duration,
+}
+
+/// Wall-clock time accumulated in each pipeline stage.
+///
+/// `decode` and `encode` measure the time spent exchanging frames with the
+/// `FFmpeg` child processes, so they also reflect backpressure from those
+/// processes. `preprocess` and `inference` are reserved for stages that are
+/// not part of the pipeline yet and are always reported as zero.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StageTimings {
+    /// Time spent probing the input with `ffprobe`.
+    pub probe: Duration,
+    /// Time spent reading decoded frames from the decoder.
+    pub decode: Duration,
+    /// Reserved for frame preprocessing; always zero for now.
+    pub preprocess: Duration,
+    /// Reserved for detector inference; always zero for now.
+    pub inference: Duration,
+    /// Time spent inside the redaction backend.
+    pub redact: Duration,
+    /// Time spent writing frames to the encoder and draining it.
+    pub encode: Duration,
 }
 
 /// Runs MP4/video decode -> RGB24 ROI redaction -> H.264 MP4 encode.
@@ -68,10 +95,14 @@ pub fn redact_video(
     redactor: &mut dyn Redactor,
     options: &PipelineOptions,
 ) -> Result<PipelineReport, FfmpegError> {
+    let started = Instant::now();
     validate_paths(options)?;
     let ffmpeg = executable("VIDEO_REDACT_FFMPEG", "ffmpeg");
     let ffprobe = executable("VIDEO_REDACT_FFPROBE", "ffprobe");
+    let mut timings = StageTimings::default();
+    let probe_started = Instant::now();
     let video = probe_video(&ffprobe, &options.input)?;
+    timings.probe = probe_started.elapsed();
     let frame_len = frame_len(&video)?;
 
     let mut decoder = spawn_decoder(&ffmpeg, &options.input)?;
@@ -91,6 +122,7 @@ pub fn redact_video(
         redactor,
         &options.regions,
         options.effect,
+        &mut timings,
     );
 
     // Closing encoder stdin is the end-of-stream signal for its rawvideo input.
@@ -106,7 +138,9 @@ pub fn redact_video(
     };
 
     let decoder_status = decoder.child.wait().map_err(FfmpegError::Io)?;
+    let encode_drain_started = Instant::now();
     let encoder_status = encoder.child.wait().map_err(FfmpegError::Io)?;
+    timings.encode += encode_drain_started.elapsed();
     // Always reap both children before reporting either process failure.
     ensure_success("ffmpeg decoder", decoder_status)?;
     ensure_success("ffmpeg encoder", encoder_status)?;
@@ -114,6 +148,8 @@ pub fn redact_video(
     Ok(PipelineReport {
         frames_processed,
         video,
+        timings,
+        elapsed: started.elapsed(),
     })
 }
 
@@ -343,16 +379,24 @@ fn process_frames(
     redactor: &mut dyn Redactor,
     regions: &[Rect],
     effect: RedactionEffect,
+    timings: &mut StageTimings,
 ) -> Result<u64, FfmpegError> {
     let mut frames_processed = 0_u64;
     let mut data = vec![0_u8; frame_len];
     loop {
-        if !read_frame(decoder, &mut data)? {
+        let decode_started = Instant::now();
+        let has_frame = read_frame(decoder, &mut data)?;
+        timings.decode += decode_started.elapsed();
+        if !has_frame {
             break;
         }
         let mut frame = RgbFrame::new(video.width, video.height, data)?;
+        let redact_started = Instant::now();
         redactor.redact(&mut frame, regions, effect)?;
+        timings.redact += redact_started.elapsed();
+        let encode_started = Instant::now();
         encoder.write_all(frame.data()).map_err(FfmpegError::Io)?;
+        timings.encode += encode_started.elapsed();
         data = frame.into_data();
         frames_processed = frames_processed.saturating_add(1);
     }
@@ -526,6 +570,7 @@ mod tests {
         };
         let input: Vec<u8> = (0..24).collect();
         let mut output = Vec::new();
+        let mut timings = StageTimings::default();
         let count = process_frames(
             &mut input.as_slice(),
             &mut output,
@@ -534,6 +579,7 @@ mod tests {
             &mut CpuRedactor,
             &[Rect::new(0, 0, 2, 2)],
             RedactionEffect::Mosaic { block_size: 2 },
+            &mut timings,
         )
         .unwrap();
 
