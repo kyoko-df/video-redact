@@ -4,9 +4,9 @@
 
 当前仓库是可运行的第一阶段脚手架：
 
-- `video-redact-core`：RGB24 帧、ROI、CPU 参考实现和后端接口。
+- `video-redact-core`：RGB24 帧、ROI、检测器与脱敏策略抽象、CPU 参考实现和后端接口。
 - `video-redact-cuda`：通过 `cudarc` + NVRTC 加载真实 CUDA ROI 马赛克 kernel。
-- `video-redact-ffmpeg`：通过 FFmpeg 解码 RGB24 帧、逐帧脱敏并编码 H.264 MP4。
+- `video-redact-ffmpeg`：通过 FFmpeg 解码 RGB24 帧，逐帧检测、按策略脱敏并编码 H.264 MP4。
 - `video-redact-cli`：运行测试图或 MP4 文件脱敏流水线。
 
 ## 快速开始
@@ -61,13 +61,15 @@ ffmpeg -i demo.ppm demo.png
 
 `redact` 当前处理第一条视频流，用输入平均帧率驱动恒定帧率编码，视频编码器为 `libx264`、像素格式为 `yuv420p`；输入音频流直接复制到输出。可通过 `VIDEO_REDACT_FFMPEG` 和 `VIDEO_REDACT_FFPROBE` 环境变量指定可执行文件路径。
 
+每帧 ROI 经过「检测 → 策略 → 脱敏」三段：检测器产出带置信度的 `Detection`，`RedactionPolicy` 按 `--min-confidence`（默认 0.5）过滤并用 `--padding` 外扩，低于阈值的检测不脱敏、而是记入 `PipelineReport::review_records` 供人工复核。静态 `--roi` 以置信度 1.0 参与策略，因此默认行为不变。运行结束会打印探测、解码、推理、脱敏、编码各阶段耗时。
+
 这是有意保留的第一条正确性基线：FFmpeg 与脱敏后端之间使用 RGB24 管道，因此 CPU 和现有 CUDA 实现都能工作，但仍有主机内存拷贝，且可变帧率输入会被归一化。后续 NVDEC/NVENC 路径将替换该传输层。
 
 ## 近期路线
 
 1. 将 RGB24 管道替换为 NVDEC/NVENC GPU frame，消除主机往返拷贝。
-2. 接入 ONNX/TensorRT 人脸及车牌检测模型。
-3. 增加目标跟踪、低置信度审核和 JSON 审计报告。
+2. 接入 ONNX/TensorRT 人脸及车牌检测模型（`Detector` trait 已就位，当前实现为静态 ROI）。
+3. 增加目标跟踪、审核记录落盘和 JSON 审计报告（低置信度检测已计入 `review_records`）。
 4. 支持 RTSP、多路并发、Prometheus 指标和容器部署。
 
 详细边界与模块关系见 [`docs/architecture.md`](docs/architecture.md)。

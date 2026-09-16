@@ -14,14 +14,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use video_redact_core::{Rect, RedactError, RedactionEffect, Redactor, RgbFrame};
+use video_redact_core::{
+    Detector, RedactError, RedactionEffect, RedactionPolicy, Redactor, ReviewRecord, RgbFrame,
+};
 
 /// Runtime settings for a file-to-file redaction job.
 #[derive(Clone, Debug)]
 pub struct PipelineOptions {
     pub input: PathBuf,
     pub output: PathBuf,
-    pub regions: Vec<Rect>,
     pub effect: RedactionEffect,
     pub overwrite: bool,
 }
@@ -48,9 +49,15 @@ impl Display for FrameRate {
 }
 
 /// Summary of a completed pipeline run.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PipelineReport {
     pub frames_processed: u64,
+    /// Detections emitted across all frames, before policy filtering.
+    pub detections: u64,
+    /// Regions actually redacted after policy filtering.
+    pub redacted_regions: u64,
+    /// Low-confidence detections withheld from redaction, for human review.
+    pub review_records: Vec<ReviewRecord>,
     pub video: VideoInfo,
     /// Wall-clock time accumulated in each pipeline stage.
     pub timings: StageTimings,
@@ -80,18 +87,23 @@ pub struct StageTimings {
     pub encode: Duration,
 }
 
-/// Runs MP4/video decode -> RGB24 ROI redaction -> H.264 MP4 encode.
+/// Runs MP4/video decode -> detect -> policy -> ROI redaction -> H.264 MP4
+/// encode.
 ///
 /// The first video stream is processed. If the input contains audio, all input
 /// audio streams are stream-copied into the output. Input metadata is copied as
 /// well. The output is encoded as H.264 (`libx264`) with `yuv420p` pixel format.
+/// Detections rejected by `policy` are not redacted; they are returned in
+/// [`PipelineReport::review_records`] for human review.
 ///
 /// # Errors
 ///
 /// Returns an error when the paths or stream metadata are invalid, `FFmpeg` is not
-/// installed, either `FFmpeg` process fails, a frame is truncated, or the selected
-/// redaction backend fails.
+/// installed, either `FFmpeg` process fails, a frame is truncated, the detector
+/// fails, or the selected redaction backend fails.
 pub fn redact_video(
+    detector: &mut dyn Detector,
+    policy: &mut RedactionPolicy,
     redactor: &mut dyn Redactor,
     options: &PipelineOptions,
 ) -> Result<PipelineReport, FfmpegError> {
@@ -119,8 +131,9 @@ pub fn redact_video(
         &mut encoder.stdin,
         frame_len,
         &video,
+        detector,
+        policy,
         redactor,
-        &options.regions,
         options.effect,
         &mut timings,
     );
@@ -128,8 +141,8 @@ pub fn redact_video(
     // Closing encoder stdin is the end-of-stream signal for its rawvideo input.
     drop(encoder.stdin);
 
-    let frames_processed = match stream_result {
-        Ok(frames_processed) => frames_processed,
+    let counts = match stream_result {
+        Ok(counts) => counts,
         Err(error) => {
             stop_child(&mut decoder.child);
             stop_child(&mut encoder.child);
@@ -146,7 +159,10 @@ pub fn redact_video(
     ensure_success("ffmpeg encoder", encoder_status)?;
 
     Ok(PipelineReport {
-        frames_processed,
+        frames_processed: counts.frames,
+        detections: counts.detections,
+        redacted_regions: counts.regions,
+        review_records: policy.review_log().to_vec(),
         video,
         timings,
         elapsed: started.elapsed(),
@@ -174,11 +190,6 @@ fn validate_paths(options: &PipelineOptions) -> Result<(), FfmpegError> {
             "output already exists: {} (pass --overwrite to replace it)",
             options.output.display()
         )));
-    }
-    if options.regions.is_empty() {
-        return Err(FfmpegError::InvalidConfiguration(
-            "at least one ROI is required".into(),
-        ));
     }
     Ok(())
 }
@@ -370,18 +381,26 @@ fn spawn_encoder(
     Ok(Encoder { child, stdin })
 }
 
+#[derive(Debug, Default)]
+struct FrameCounts {
+    frames: u64,
+    detections: u64,
+    regions: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_frames(
     decoder: &mut impl Read,
     encoder: &mut impl Write,
     frame_len: usize,
     video: &VideoInfo,
+    detector: &mut dyn Detector,
+    policy: &mut RedactionPolicy,
     redactor: &mut dyn Redactor,
-    regions: &[Rect],
     effect: RedactionEffect,
     timings: &mut StageTimings,
-) -> Result<u64, FfmpegError> {
-    let mut frames_processed = 0_u64;
+) -> Result<FrameCounts, FfmpegError> {
+    let mut counts = FrameCounts::default();
     let mut data = vec![0_u8; frame_len];
     loop {
         let decode_started = Instant::now();
@@ -391,16 +410,26 @@ fn process_frames(
             break;
         }
         let mut frame = RgbFrame::new(video.width, video.height, data)?;
-        let redact_started = Instant::now();
-        redactor.redact(&mut frame, regions, effect)?;
-        timings.redact += redact_started.elapsed();
+        let inference_started = Instant::now();
+        let detections = detector
+            .detect(&frame, counts.frames)
+            .map_err(FfmpegError::Detection)?;
+        timings.inference += inference_started.elapsed();
+        counts.detections = counts.detections.saturating_add(detections.len() as u64);
+        let regions = policy.resolve(detections, video.width, video.height, counts.frames);
+        counts.regions = counts.regions.saturating_add(regions.len() as u64);
+        if !regions.is_empty() {
+            let redact_started = Instant::now();
+            redactor.redact(&mut frame, &regions, effect)?;
+            timings.redact += redact_started.elapsed();
+        }
         let encode_started = Instant::now();
         encoder.write_all(frame.data()).map_err(FfmpegError::Io)?;
         timings.encode += encode_started.elapsed();
         data = frame.into_data();
-        frames_processed = frames_processed.saturating_add(1);
+        counts.frames = counts.frames.saturating_add(1);
     }
-    Ok(frames_processed)
+    Ok(counts)
 }
 
 fn read_frame(reader: &mut impl Read, data: &mut [u8]) -> Result<bool, FfmpegError> {
@@ -462,6 +491,7 @@ pub enum FfmpegError {
         actual: usize,
     },
     Io(io::Error),
+    Detection(RedactError),
     Redaction(RedactError),
 }
 
@@ -489,6 +519,7 @@ impl Display for FfmpegError {
                 "decoder returned a truncated RGB frame: expected {expected} bytes, got {actual}"
             ),
             Self::Io(error) => write!(formatter, "video pipeline I/O error: {error}"),
+            Self::Detection(error) => write!(formatter, "detection failed: {error}"),
             Self::Redaction(error) => write!(formatter, "redaction failed: {error}"),
         }
     }
@@ -498,7 +529,7 @@ impl Error for FfmpegError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Redaction(error) => Some(error),
+            Self::Detection(error) | Self::Redaction(error) => Some(error),
             _ => None,
         }
     }
@@ -513,7 +544,9 @@ impl From<RedactError> for FfmpegError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use video_redact_core::CpuRedactor;
+    use video_redact_core::{
+        CpuRedactor, Detection, DetectionLabel, Rect, StaticDetector,
+    };
 
     #[test]
     fn parses_ffprobe_video_stream() {
@@ -571,23 +604,78 @@ mod tests {
         let input: Vec<u8> = (0..24).collect();
         let mut output = Vec::new();
         let mut timings = StageTimings::default();
-        let count = process_frames(
+        let mut detector = StaticDetector::new(vec![Rect::new(0, 0, 2, 2)]);
+        let mut policy = RedactionPolicy::new(0.5, 0).unwrap();
+        let counts = process_frames(
             &mut input.as_slice(),
             &mut output,
             12,
             &video,
+            &mut detector,
+            &mut policy,
             &mut CpuRedactor,
-            &[Rect::new(0, 0, 2, 2)],
             RedactionEffect::Mosaic { block_size: 2 },
             &mut timings,
         )
         .unwrap();
 
-        assert_eq!(count, 2);
+        assert_eq!(counts.frames, 2);
+        assert_eq!(counts.detections, 2);
+        assert_eq!(counts.regions, 2);
         assert_eq!(&output[..12], &[4, 5, 6, 4, 5, 6, 4, 5, 6, 4, 5, 6]);
         assert_eq!(
             &output[12..],
             &[16, 17, 18, 16, 17, 18, 16, 17, 18, 16, 17, 18]
         );
+    }
+
+    #[test]
+    fn low_confidence_detections_skip_redaction() {
+        struct WeakDetector;
+
+        impl Detector for WeakDetector {
+            fn detect(
+                &mut self,
+                _frame: &RgbFrame,
+                _frame_index: u64,
+            ) -> Result<Vec<Detection>, RedactError> {
+                Ok(vec![Detection {
+                    rect: Rect::new(0, 0, 2, 2),
+                    confidence: 0.1,
+                    label: DetectionLabel::Face,
+                }])
+            }
+        }
+
+        let video = VideoInfo {
+            width: 2,
+            height: 2,
+            frame_rate: FrameRate {
+                numerator: 25,
+                denominator: 1,
+            },
+        };
+        let input: Vec<u8> = (0..24).collect();
+        let mut output = Vec::new();
+        let mut timings = StageTimings::default();
+        let mut policy = RedactionPolicy::new(0.5, 0).unwrap();
+        let counts = process_frames(
+            &mut input.as_slice(),
+            &mut output,
+            12,
+            &video,
+            &mut WeakDetector,
+            &mut policy,
+            &mut CpuRedactor,
+            RedactionEffect::Mosaic { block_size: 2 },
+            &mut timings,
+        )
+        .unwrap();
+
+        assert_eq!(counts.frames, 2);
+        assert_eq!(counts.detections, 2);
+        assert_eq!(counts.regions, 0);
+        assert_eq!(policy.review_log().len(), 2);
+        assert_eq!(output, input);
     }
 }

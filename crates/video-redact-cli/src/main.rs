@@ -4,7 +4,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use video_redact_core::{CpuRedactor, Rect, RedactionEffect, Redactor, RgbFrame};
+use video_redact_core::{
+    CpuRedactor, Detector, Rect, RedactionEffect, RedactionPolicy, Redactor, RgbFrame,
+    StaticDetector,
+};
 use video_redact_ffmpeg::{PipelineOptions, PipelineReport, redact_video};
 
 const HELP: &str = "\
@@ -17,6 +20,8 @@ USAGE:
 
 REDACT OPTIONS:
     --roi L,T,R,B       Static half-open ROI; may be supplied more than once
+    --min-confidence F  Confidence needed to redact a detection (default: 0.5)
+    --padding N         Pixels added around each detection (default: 0)
     --block-size N      Mosaic block size in pixels (default: 16)
     --backend NAME      Redaction backend: cpu or cuda (default: cpu)
     --overwrite         Replace the output file if it already exists
@@ -58,16 +63,17 @@ fn run_video_redact(args: &[String]) -> Result<(), Box<dyn Error>> {
     let options = PipelineOptions {
         input: parsed.input,
         output: parsed.output,
-        regions: parsed.regions,
         effect: RedactionEffect::Mosaic {
             block_size: parsed.block_size,
         },
         overwrite: parsed.overwrite,
     };
+    let mut detector = StaticDetector::new(parsed.regions);
+    let mut policy = RedactionPolicy::new(parsed.min_confidence, parsed.padding)?;
 
     let report = match parsed.backend.as_str() {
-        "cpu" => redact_video(&mut CpuRedactor, &options)?,
-        "cuda" => redact_video_with_cuda(&options)?,
+        "cpu" => redact_video(&mut detector, &mut policy, &mut CpuRedactor, &options)?,
+        "cuda" => redact_video_with_cuda(&mut detector, &mut policy, &options)?,
         other => return Err(format!("unsupported backend `{other}`; use cpu or cuda").into()),
     };
 
@@ -80,6 +86,8 @@ struct VideoArgs {
     input: PathBuf,
     output: PathBuf,
     regions: Vec<Rect>,
+    min_confidence: f32,
+    padding: u32,
     block_size: u32,
     backend: String,
     overwrite: bool,
@@ -89,6 +97,8 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
     let mut input = None;
     let mut output = None;
     let mut regions = Vec::new();
+    let mut min_confidence = 0.5_f32;
+    let mut padding = 0_u32;
     let mut block_size = 16;
     let mut backend = String::from("cpu");
     let mut overwrite = false;
@@ -114,6 +124,22 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
                     args.get(index).ok_or("--roi requires L,T,R,B")?,
                 )?);
             }
+            "--min-confidence" => {
+                index += 1;
+                min_confidence = args
+                    .get(index)
+                    .ok_or("--min-confidence requires a value in [0, 1]")?
+                    .parse::<f32>()
+                    .map_err(|_| "--min-confidence requires a value in [0, 1]")?;
+            }
+            "--padding" => {
+                index += 1;
+                padding = args
+                    .get(index)
+                    .ok_or("--padding requires a non-negative integer")?
+                    .parse::<u32>()
+                    .map_err(|_| "--padding requires a non-negative integer")?;
+            }
             "--block-size" => {
                 index += 1;
                 block_size = args
@@ -135,10 +161,16 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
         index += 1;
     }
 
+    if regions.is_empty() {
+        return Err("redact requires at least one --roi".into());
+    }
+
     Ok(VideoArgs {
         input: input.ok_or("redact requires --input PATH")?,
         output: output.ok_or("redact requires --output PATH")?,
         regions,
+        min_confidence,
+        padding,
         block_size,
         backend,
         overwrite,
@@ -169,6 +201,12 @@ fn print_pipeline_report(options: &PipelineOptions, report: &PipelineReport, bac
         report.video.height,
         report.video.frame_rate,
     );
+    println!(
+        "detections: {}, regions redacted: {}, flagged for review: {}",
+        report.detections,
+        report.redacted_regions,
+        report.review_records.len(),
+    );
     let timings = &report.timings;
     println!(
         "timings: probe {:.2?}, decode {:.2?}, redact {:.2?}, encode {:.2?}, total {:.2?}",
@@ -177,13 +215,21 @@ fn print_pipeline_report(options: &PipelineOptions, report: &PipelineReport, bac
 }
 
 #[cfg(feature = "cuda")]
-fn redact_video_with_cuda(options: &PipelineOptions) -> Result<PipelineReport, Box<dyn Error>> {
+fn redact_video_with_cuda(
+    detector: &mut dyn Detector,
+    policy: &mut RedactionPolicy,
+    options: &PipelineOptions,
+) -> Result<PipelineReport, Box<dyn Error>> {
     let mut redactor = video_redact_cuda::CudaRedactor::new(0)?;
-    Ok(redact_video(&mut redactor, options)?)
+    Ok(redact_video(detector, policy, &mut redactor, options)?)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn redact_video_with_cuda(_options: &PipelineOptions) -> Result<PipelineReport, Box<dyn Error>> {
+fn redact_video_with_cuda(
+    _detector: &mut dyn Detector,
+    _policy: &mut RedactionPolicy,
+    _options: &PipelineOptions,
+) -> Result<PipelineReport, Box<dyn Error>> {
     Err("CUDA support is disabled; rebuild with `--features cuda`".into())
 }
 
@@ -275,6 +321,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn parses_repeated_rois_and_options() {
         let args = [
             "--input",
@@ -295,7 +342,16 @@ mod tests {
         assert_eq!(parsed.input, PathBuf::from("in.mp4"));
         assert_eq!(parsed.regions.len(), 2);
         assert_eq!(parsed.block_size, 12);
+        assert_eq!(parsed.min_confidence, 0.5);
+        assert_eq!(parsed.padding, 0);
         assert!(parsed.overwrite);
+    }
+
+    #[test]
+    fn rejects_missing_roi() {
+        let args = ["--input", "in.mp4", "--output", "out.mp4"].map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(error.to_string().contains("--roi"));
     }
 
     #[test]

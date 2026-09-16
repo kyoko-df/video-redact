@@ -20,7 +20,8 @@ file / RTSP
 MP4 file
     -> FFmpeg demux + software decode
     -> RGB24 stdout pipe
-    -> CPU/CUDA Redactor (static ROI mosaic)
+    -> Detector (static ROI) -> policy (confidence/padding/review)
+    -> CPU/CUDA Redactor (mosaic)
     -> RGB24 stdin pipe
     -> FFmpeg libx264 encode + input audio stream copy
     -> MP4 file
@@ -34,7 +35,7 @@ MP4 file
 - `video-redact-ffmpeg` 管理探测、解码/编码子进程和逐帧调度，不包含具体脱敏策略。
 - `video-redact-cuda` 只处理已经解码的帧；当前用 RGB24 验证 kernel，接入 NVDEC 后扩展为 NV12/P010。
 - `video-redact-cli` 只负责参数、I/O 和后端装配，业务策略不放进 CLI。
-- 检测器和跟踪器将作为独立 trait 接入，避免把 TensorRT 生命周期耦合到视频解码器。
+- 检测器通过 `Detector` trait 接入（当前实现为静态 ROI），策略层独立做置信度过滤、区域外扩和审核记录；跟踪器与 TensorRT 实现将复用同一接缝，不耦合到视频解码器。
 
 ## 性能原则
 
