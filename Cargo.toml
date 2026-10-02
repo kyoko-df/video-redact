@@ -3,6 +3,7 @@ members = [
     "crates/video-redact-cli",
     "crates/video-redact-core",
     "crates/video-redact-cuda",
+    "crates/video-redact-detect",
     "crates/video-redact-ffmpeg",
 ]
 resolver = "3"
@@ -15,6 +16,7 @@ rust-version = "1.90"
 [workspace.dependencies]
 video-redact-core = { path = "crates/video-redact-core" }
 video-redact-cuda = { path = "crates/video-redact-cuda" }
+video-redact-detect = { path = "crates/video-redact-detect" }
 video-redact-ffmpeg = { path = "crates/video-redact-ffmpeg" }
 
 [workspace.lints.rust]

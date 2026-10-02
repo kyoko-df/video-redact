@@ -1,0 +1,12 @@
+[package]
+name = "video-redact-detect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+video-redact-core.workspace = true
+tract-onnx = "0.22.4"
+
+[lints]
+workspace = true

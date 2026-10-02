@@ -6,6 +6,7 @@
 
 - `video-redact-core`：RGB24 帧、ROI、检测器与脱敏策略抽象、CPU 参考实现和后端接口。
 - `video-redact-cuda`：通过 `cudarc` + NVRTC 加载真实 CUDA ROI 马赛克 kernel。
+- `video-redact-detect`：基于 `tract` ONNX 运行时的 YuNet 人脸检测器（CPU，可选接入）。
 - `video-redact-ffmpeg`：通过 FFmpeg 解码 RGB24 帧，逐帧检测、按策略脱敏并编码 H.264 MP4。
 - `video-redact-cli`：运行测试图或 MP4 文件脱敏流水线。
 
@@ -32,6 +33,21 @@ cargo run -p video-redact-cli -- redact \
 
 ROI 使用半开区间 `left,top,right,bottom`，会应用到视频的每一帧；超出画面的部分会自动裁剪。重复执行并替换已有输出时添加 `--overwrite`。
 
+使用 YuNet ONNX 人脸检测替代静态 ROI（`--features yunet`，CPU 推理；模型文件需手工下载，见 [`models/README.md`](models/README.md)）。建议加 `--release`：debug 构建的 CPU 推理明显较慢：
+
+```bash
+cargo run --release -p video-redact-cli --features yunet -- redact \
+  --input input.mp4 \
+  --output redacted.mp4 \
+  --detector yunet \
+  --model models/face_detection_yunet_2023mar.onnx \
+  --min-confidence 0.5 \
+  --padding 8 \
+  --backend cpu
+```
+
+`--detector yunet` 与 `--roi` 互斥（检测器在视频元数据就绪前就完成模型加载，模型缺失会在写出输出前失败）。说明：当前只处理画面中的可见人脸；输入音频与元数据照常复制到输出；没有跨帧跟踪，也不保证零漏检。`--min-confidence` 只决定哪些检测进入脱敏，低于阈值的模型候选不会进入 `review_records`——不构成完整人工审核闭环。
+
 在装有 NVIDIA 驱动及 CUDA 12.8 runtime/toolkit 的 Linux 主机上验证 CUDA 路径：
 
 ```bash
@@ -51,6 +67,7 @@ CUDA 测试会逐像素比对 CPU 参考实现，覆盖不完整马赛克块、�
 video-redact info
 video-redact demo [--output demo.ppm] [--backend cpu|cuda]
 video-redact redact --input PATH --output PATH --roi L,T,R,B [OPTIONS]
+video-redact redact --input PATH --output PATH --detector yunet --model PATH [OPTIONS]  # --features yunet
 ```
 
 `demo` 会生成一张 RGB 测试图，并对两个矩形区域应用马赛克。PPM 可以被多数图像工具打开，也可以使用 FFmpeg 转换：
@@ -61,14 +78,14 @@ ffmpeg -i demo.ppm demo.png
 
 `redact` 当前处理第一条视频流，用输入平均帧率驱动恒定帧率编码，视频编码器为 `libx264`、像素格式为 `yuv420p`；输入音频流直接复制到输出。可通过 `VIDEO_REDACT_FFMPEG` 和 `VIDEO_REDACT_FFPROBE` 环境变量指定可执行文件路径。
 
-每帧 ROI 经过「检测 → 策略 → 脱敏」三段：检测器产出带置信度的 `Detection`，`RedactionPolicy` 按 `--min-confidence`（默认 0.5）过滤并用 `--padding` 外扩，低于阈值的检测不脱敏、而是记入 `PipelineReport::review_records` 供人工复核。静态 `--roi` 以置信度 1.0 参与策略，因此默认行为不变。运行结束会打印探测、解码、推理、脱敏、编码各阶段耗时。
+每帧 ROI 经过「检测 → 策略 → 脱敏」三段：检测器产出带置信度的 `Detection`，`RedactionPolicy` 按 `--min-confidence`（默认 0.5）过滤并用 `--padding` 外扩，低于阈值的检测不脱敏、而是记入 `PipelineReport::review_records` 供人工复核——这一复核语义适用于静态 `--roi` 和自定义检测器上报的低置信度 `Detection`；YuNet 检测器内部已经按 `--min-confidence` 预过滤，低于阈值的模型候选不会生成 `Detection`，也不会进入 `review_records`。静态 `--roi` 以置信度 1.0 参与策略，因此默认行为不变。运行结束会打印探测、解码、推理、脱敏、编码各阶段耗时。
 
 这是有意保留的第一条正确性基线：FFmpeg 与脱敏后端之间使用 RGB24 管道，因此 CPU 和现有 CUDA 实现都能工作，但仍有主机内存拷贝，且可变帧率输入会被归一化。后续 NVDEC/NVENC 路径将替换该传输层。
 
 ## 近期路线
 
 1. 将 RGB24 管道替换为 NVDEC/NVENC GPU frame，消除主机往返拷贝。
-2. 接入 ONNX/TensorRT 人脸及车牌检测模型（`Detector` trait 已就位，当前实现为静态 ROI）。
+2. 接入检测模型：YuNet ONNX CPU 人脸检测已落地（`--detector yunet`）；TensorRT GPU 推理与车牌检测待接入（`Detector` trait 同一接缝）。
 3. 增加目标跟踪、审核记录落盘和 JSON 审计报告（低置信度检测已计入 `review_records`）。
 4. 支持 RTSP、多路并发、Prometheus 指标和容器部署。
 

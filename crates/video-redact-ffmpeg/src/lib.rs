@@ -69,8 +69,9 @@ pub struct PipelineReport {
 ///
 /// `decode` and `encode` measure the time spent exchanging frames with the
 /// `FFmpeg` child processes, so they also reflect backpressure from those
-/// processes. `preprocess` and `inference` are reserved for stages that are
-/// not part of the pipeline yet and are always reported as zero.
+/// processes. `inference` measures each `Detector::detect` call; a detector's
+/// own preprocessing and post-processing are counted there as well.
+/// `preprocess` is reserved and always reported as zero.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StageTimings {
     /// Time spent probing the input with `ffprobe`.
@@ -79,7 +80,8 @@ pub struct StageTimings {
     pub decode: Duration,
     /// Reserved for frame preprocessing; always zero for now.
     pub preprocess: Duration,
-    /// Reserved for detector inference; always zero for now.
+    /// Time spent inside `Detector::detect`, including the detector's own
+    /// preprocessing and post-processing.
     pub inference: Duration,
     /// Time spent inside the redaction backend.
     pub redact: Duration,
@@ -544,9 +546,7 @@ impl From<RedactError> for FfmpegError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use video_redact_core::{
-        CpuRedactor, Detection, DetectionLabel, Rect, StaticDetector,
-    };
+    use video_redact_core::{CpuRedactor, Detection, DetectionLabel, Rect, StaticDetector};
 
     #[test]
     fn parses_ffprobe_video_stream() {

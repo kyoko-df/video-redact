@@ -11,10 +11,12 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["dep:video-redact-cuda", "video-redact-cuda/cuda"]
+yunet = ["dep:video-redact-detect"]
 
 [dependencies]
 video-redact-core.workspace = true
 video-redact-cuda = { workspace = true, optional = true }
+video-redact-detect = { workspace = true, optional = true }
 video-redact-ffmpeg.workspace = true
 
 [lints]

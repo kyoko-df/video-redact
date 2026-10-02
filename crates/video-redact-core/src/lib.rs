@@ -225,11 +225,8 @@ pub trait Detector {
     /// # Errors
     ///
     /// Returns [`RedactError::Backend`] when detection cannot be completed.
-    fn detect(
-        &mut self,
-        frame: &RgbFrame,
-        frame_index: u64,
-    ) -> Result<Vec<Detection>, RedactError>;
+    fn detect(&mut self, frame: &RgbFrame, frame_index: u64)
+    -> Result<Vec<Detection>, RedactError>;
 }
 
 /// A [`Detector`] that reports the same regions on every frame.

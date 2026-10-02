@@ -16,10 +16,12 @@ video-redact — GPU video privacy redaction scaffold
 USAGE:
     video-redact info
     video-redact demo [--output PATH] [--backend cpu|cuda]
-    video-redact redact --input PATH --output PATH --roi L,T,R,B [OPTIONS]
+    video-redact redact --input PATH --output PATH [--roi L,T,R,B ...] [OPTIONS]
 
 REDACT OPTIONS:
     --roi L,T,R,B       Static half-open ROI; may be supplied more than once
+    --detector NAME     Detector: static or yunet (default: static)
+    --model PATH        YuNet ONNX model path; required by --detector yunet
     --min-confidence F  Confidence needed to redact a detection (default: 0.5)
     --padding N         Pixels added around each detection (default: 0)
     --block-size N      Mosaic block size in pixels (default: 16)
@@ -60,6 +62,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn run_video_redact(args: &[String]) -> Result<(), Box<dyn Error>> {
     let parsed = parse_video_args(args)?;
+    // The detector (and any model file) is loaded before the FFmpeg pipeline
+    // starts, so a bad --model fails before the output is touched.
+    let mut detector = build_detector(&parsed)?;
+    let mut policy = RedactionPolicy::new(parsed.min_confidence, parsed.padding)?;
     let options = PipelineOptions {
         input: parsed.input,
         output: parsed.output,
@@ -68,12 +74,10 @@ fn run_video_redact(args: &[String]) -> Result<(), Box<dyn Error>> {
         },
         overwrite: parsed.overwrite,
     };
-    let mut detector = StaticDetector::new(parsed.regions);
-    let mut policy = RedactionPolicy::new(parsed.min_confidence, parsed.padding)?;
 
     let report = match parsed.backend.as_str() {
-        "cpu" => redact_video(&mut detector, &mut policy, &mut CpuRedactor, &options)?,
-        "cuda" => redact_video_with_cuda(&mut detector, &mut policy, &options)?,
+        "cpu" => redact_video(&mut *detector, &mut policy, &mut CpuRedactor, &options)?,
+        "cuda" => redact_video_with_cuda(&mut *detector, &mut policy, &options)?,
         other => return Err(format!("unsupported backend `{other}`; use cpu or cuda").into()),
     };
 
@@ -81,11 +85,42 @@ fn run_video_redact(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn build_detector(parsed: &VideoArgs) -> Result<Box<dyn Detector>, Box<dyn Error>> {
+    match parsed.detector.as_str() {
+        "static" => Ok(Box::new(StaticDetector::new(parsed.regions.clone()))),
+        "yunet" => build_yunet_detector(parsed),
+        other => Err(format!("unsupported detector `{other}`; use static or yunet").into()),
+    }
+}
+
+#[cfg(feature = "yunet")]
+fn build_yunet_detector(parsed: &VideoArgs) -> Result<Box<dyn Detector>, Box<dyn Error>> {
+    let model = parsed
+        .model
+        .as_ref()
+        .ok_or("--detector yunet requires --model PATH")?;
+    Ok(Box::new(video_redact_detect::YuNetDetector::new(
+        model,
+        parsed.min_confidence,
+    )?))
+}
+
+#[cfg(not(feature = "yunet"))]
+fn build_yunet_detector(parsed: &VideoArgs) -> Result<Box<dyn Detector>, Box<dyn Error>> {
+    Err(format!(
+        "detector `yunet` is not available (model {:?}); rebuild with `--features yunet`",
+        parsed.model
+    )
+    .into())
+}
+
 #[derive(Debug)]
 struct VideoArgs {
     input: PathBuf,
     output: PathBuf,
     regions: Vec<Rect>,
+    detector: String,
+    model: Option<PathBuf>,
     min_confidence: f32,
     padding: u32,
     block_size: u32,
@@ -97,6 +132,8 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
     let mut input = None;
     let mut output = None;
     let mut regions = Vec::new();
+    let mut detector = String::from("static");
+    let mut model = None;
     let mut min_confidence = 0.5_f32;
     let mut padding = 0_u32;
     let mut block_size = 16;
@@ -124,6 +161,19 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
                     args.get(index).ok_or("--roi requires L,T,R,B")?,
                 )?);
             }
+            "--detector" => {
+                index += 1;
+                detector.clone_from(
+                    args.get(index)
+                        .ok_or("--detector requires static or yunet")?,
+                );
+            }
+            "--model" => {
+                index += 1;
+                model = Some(PathBuf::from(
+                    args.get(index).ok_or("--model requires a path")?,
+                ));
+            }
             "--min-confidence" => {
                 index += 1;
                 min_confidence = args
@@ -131,6 +181,9 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
                     .ok_or("--min-confidence requires a value in [0, 1]")?
                     .parse::<f32>()
                     .map_err(|_| "--min-confidence requires a value in [0, 1]")?;
+                if !(0.0..=1.0).contains(&min_confidence) {
+                    return Err("--min-confidence requires a value in [0, 1]".into());
+                }
             }
             "--padding" => {
                 index += 1;
@@ -161,20 +214,53 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
         index += 1;
     }
 
-    if regions.is_empty() {
-        return Err("redact requires at least one --roi".into());
+    check_detector_args(&detector, model.as_ref(), &regions)?;
+    match backend.as_str() {
+        "cpu" | "cuda" => {}
+        other => return Err(format!("unsupported backend `{other}`; use cpu or cuda").into()),
     }
 
     Ok(VideoArgs {
         input: input.ok_or("redact requires --input PATH")?,
         output: output.ok_or("redact requires --output PATH")?,
         regions,
+        detector,
+        model,
         min_confidence,
         padding,
         block_size,
         backend,
         overwrite,
     })
+}
+
+fn check_detector_args(
+    detector: &str,
+    model: Option<&PathBuf>,
+    regions: &[Rect],
+) -> Result<(), Box<dyn Error>> {
+    match detector {
+        "static" => {
+            if regions.is_empty() {
+                return Err("redact requires at least one --roi".into());
+            }
+            if model.is_some() {
+                return Err("--model is only valid with --detector yunet".into());
+            }
+        }
+        "yunet" => {
+            if model.is_none() {
+                return Err("--detector yunet requires --model PATH".into());
+            }
+            if !regions.is_empty() {
+                return Err("--detector yunet does not accept --roi".into());
+            }
+        }
+        other => {
+            return Err(format!("unsupported detector `{other}`; use static or yunet").into());
+        }
+    }
+    Ok(())
 }
 
 fn parse_rect(value: &str) -> Result<Rect, Box<dyn Error>> {
@@ -209,8 +295,13 @@ fn print_pipeline_report(options: &PipelineOptions, report: &PipelineReport, bac
     );
     let timings = &report.timings;
     println!(
-        "timings: probe {:.2?}, decode {:.2?}, redact {:.2?}, encode {:.2?}, total {:.2?}",
-        timings.probe, timings.decode, timings.redact, timings.encode, report.elapsed,
+        "timings: probe {:.2?}, decode {:.2?}, inference {:.2?}, redact {:.2?}, encode {:.2?}, total {:.2?}",
+        timings.probe,
+        timings.decode,
+        timings.inference,
+        timings.redact,
+        timings.encode,
+        report.elapsed,
     );
 }
 
@@ -352,6 +443,184 @@ mod tests {
         let args = ["--input", "in.mp4", "--output", "out.mp4"].map(String::from);
         let error = parse_video_args(&args).unwrap_err();
         assert!(error.to_string().contains("--roi"));
+    }
+
+    #[test]
+    fn parses_yunet_detector_without_roi() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+            "--model",
+            "models/face_detection_yunet_2023mar.onnx",
+        ]
+        .map(String::from);
+        let parsed = parse_video_args(&args).unwrap();
+
+        assert_eq!(parsed.detector, "yunet");
+        assert_eq!(
+            parsed.model.as_deref(),
+            Some(Path::new("models/face_detection_yunet_2023mar.onnx"))
+        );
+        assert!(parsed.regions.is_empty());
+    }
+
+    #[test]
+    fn rejects_yunet_without_model() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(error.to_string().contains("--model"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unknown_detector() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "hog",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported detector"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_model_with_static_detector() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--roi",
+            "1,2,30,40",
+            "--model",
+            "model.onnx",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(error.to_string().contains("--model"), "{error}");
+    }
+
+    #[test]
+    fn rejects_roi_with_yunet() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+            "--model",
+            "model.onnx",
+            "--roi",
+            "1,2,30,40",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(error.to_string().contains("--roi"), "{error}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_min_confidence() {
+        for value in ["1.5", "-0.1", "nan", "abc"] {
+            let args = [
+                "--input",
+                "in.mp4",
+                "--output",
+                "out.mp4",
+                "--roi",
+                "1,2,3,4",
+                "--min-confidence",
+                value,
+            ]
+            .map(String::from);
+            assert!(
+                parse_video_args(&args).is_err(),
+                "expected `{value}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_backend_early() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--roi",
+            "1,2,3,4",
+            "--backend",
+            "opencl",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(error.to_string().contains("unsupported backend"), "{error}");
+    }
+
+    #[cfg(not(feature = "yunet"))]
+    #[test]
+    fn yunet_detector_reports_missing_feature() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+            "--model",
+            "model.onnx",
+        ]
+        .map(String::from);
+        let parsed = parse_video_args(&args).unwrap();
+        let error = build_detector(&parsed).err().unwrap();
+        assert!(error.to_string().contains("--features yunet"), "{error}");
+    }
+
+    #[cfg(feature = "yunet")]
+    #[test]
+    fn missing_model_fails_before_output() {
+        // Unique path: a stale file from an earlier run must not mask a
+        // regression that creates the output before loading the model.
+        let output = std::env::temp_dir().join(format!(
+            "video-redact-missing-model-{}-{:?}.mp4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            output.to_str().unwrap(),
+            "--detector",
+            "yunet",
+            "--model",
+            "/nonexistent/yunet.onnx",
+        ]
+        .map(String::from);
+        let error = run_video_redact(&args).err().unwrap();
+        assert!(error.to_string().contains("model"), "{error}");
+        assert!(!output.exists(), "output must not be created: {error}");
     }
 
     #[test]
