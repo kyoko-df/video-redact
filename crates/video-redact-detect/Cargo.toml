@@ -4,9 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+coreml = ["dep:ort", "dep:libloading"]
+
 [dependencies]
 video-redact-core.workspace = true
 tract-onnx = "0.22.4"
+
+# `api-24` matches ONNX Runtime 1.24.x and is required for `load-dynamic` to
+# compile the full OrtApi (e.g. the VitisAI registration path). `libloading`
+# pre-validates the runtime before `ort::init_from`, whose own load-error path
+# deadlocks (Error::new -> crate::api() -> G_ORT_LIB re-entrant OnceLock).
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "load-dynamic",
+    "coreml",
+    "api-24",
+], optional = true }
+libloading = { version = "0.9", optional = true }
 
 [lints]
 workspace = true

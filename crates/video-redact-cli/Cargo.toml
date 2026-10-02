@@ -12,6 +12,7 @@ path = "src/main.rs"
 default = []
 cuda = ["dep:video-redact-cuda", "video-redact-cuda/cuda"]
 yunet = ["dep:video-redact-detect"]
+coreml = ["yunet", "video-redact-detect/coreml"]
 
 [dependencies]
 video-redact-core.workspace = true

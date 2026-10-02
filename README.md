@@ -48,6 +48,23 @@ cargo run --release -p video-redact-cli --features yunet -- redact \
 
 `--detector yunet` 与 `--roi` 互斥（检测器在视频元数据就绪前就完成模型加载，模型缺失会在写出输出前失败）。说明：当前只处理画面中的可见人脸；输入音频与元数据照常复制到输出；没有跨帧跟踪，也不保证零漏检。`--min-confidence` 只决定哪些检测进入脱敏，低于阈值的模型候选不会进入 `review_records`——不构成完整人工审核闭环。
 
+在 Apple Silicon Mac 上，YuNet 推理可以改用 ONNX Runtime 的 CoreML execution provider（`--features coreml`；运行时需手工下载官方发行包，见 [`runtime/README.md`](runtime/README.md)）：
+
+```bash
+cargo run --release -p video-redact-cli --features coreml -- redact \
+  --input input.mp4 \
+  --output redacted.mp4 \
+  --detector yunet \
+  --model models/face_detection_yunet_2023mar.onnx \
+  --inference-backend coreml \
+  --ort-library runtime/onnxruntime-osx-arm64-1.24.3/lib/libonnxruntime.1.24.3.dylib \
+  --min-confidence 0.5 \
+  --padding 8 \
+  --backend cpu
+```
+
+CoreML 路径只加速模型推理：FFmpeg 解码、letterbox 预处理、NMS 后处理、马赛克和编码仍在 CPU/Rust 上执行。会话使用 `ModelFormat=MLProgram`、`MLComputeUnits=CPUAndGPU`（算子分配由 CoreML 自行决定，不保证每个算子都跑在 GPU）、静态输入形状，并禁用 ORT CPU fallback——不被 CoreML 支持的图会直接报错，不会静默退回 CPU。首次会话编译模型需要明显更长的时间，不提供性能或零漏检保证。`--ort-library` 也可以由 `VIDEO_REDACT_ORT_DYLIB` 环境变量提供。
+
 在装有 NVIDIA 驱动及 CUDA 12.8 runtime/toolkit 的 Linux 主机上验证 CUDA 路径：
 
 ```bash
@@ -68,6 +85,8 @@ video-redact info
 video-redact demo [--output demo.ppm] [--backend cpu|cuda]
 video-redact redact --input PATH --output PATH --roi L,T,R,B [OPTIONS]
 video-redact redact --input PATH --output PATH --detector yunet --model PATH [OPTIONS]  # --features yunet
+video-redact redact --input PATH --output PATH --detector yunet --model PATH \
+    --inference-backend coreml --ort-library PATH [OPTIONS]                          # --features coreml (macOS arm64)
 ```
 
 `demo` 会生成一张 RGB 测试图，并对两个矩形区域应用马赛克。PPM 可以被多数图像工具打开，也可以使用 FFmpeg 转换：
@@ -85,7 +104,7 @@ ffmpeg -i demo.ppm demo.png
 ## 近期路线
 
 1. 将 RGB24 管道替换为 NVDEC/NVENC GPU frame，消除主机往返拷贝。
-2. 接入检测模型：YuNet ONNX CPU 人脸检测已落地（`--detector yunet`）；TensorRT GPU 推理与车牌检测待接入（`Detector` trait 同一接缝）。
+2. 接入检测模型：YuNet ONNX 人脸检测已落地（`--detector yunet`，默认 tract CPU，Apple Silicon 可选 `--inference-backend coreml`）；TensorRT GPU 推理与车牌检测待接入（`Detector` trait 同一接缝）。
 3. 增加目标跟踪、审核记录落盘和 JSON 审计报告（低置信度检测已计入 `review_records`）。
 4. 支持 RTSP、多路并发、Prometheus 指标和容器部署。
 

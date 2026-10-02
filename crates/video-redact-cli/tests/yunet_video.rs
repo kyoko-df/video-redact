@@ -155,3 +155,120 @@ fn yunet_redacts_a_face_video() {
     }
     println!("artifacts in {}", work.display());
 }
+
+#[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires VIDEO_REDACT_ORT_DYLIB, VIDEO_REDACT_YUNET_MODEL and VIDEO_REDACT_FACE_IMAGE"]
+fn yunet_redacts_a_face_video_with_coreml() {
+    // Running with `--ignored` without the required fixtures fails loudly
+    // instead of silently passing.
+    let library = std::env::var_os("VIDEO_REDACT_ORT_DYLIB")
+        .map(PathBuf::from)
+        .expect("VIDEO_REDACT_ORT_DYLIB must point at libonnxruntime.dylib");
+    let model = std::env::var_os("VIDEO_REDACT_YUNET_MODEL")
+        .map(PathBuf::from)
+        .expect("VIDEO_REDACT_YUNET_MODEL must point at face_detection_yunet_2023mar.onnx");
+    let image = std::env::var_os("VIDEO_REDACT_FACE_IMAGE")
+        .map(PathBuf::from)
+        .expect("VIDEO_REDACT_FACE_IMAGE must point at a face image");
+
+    // VIDEO_REDACT_E2E_DIR is a parent directory; each run creates an
+    // exclusive child so artifacts are never overwritten.
+    let parent =
+        std::env::var_os("VIDEO_REDACT_E2E_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    std::fs::create_dir_all(&parent).unwrap();
+    let work = parent.join(format!(
+        "run-coreml-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    std::fs::create_dir(&work).unwrap();
+    let input = work.join("input.mp4");
+    let output_path = work.join("redacted.mp4");
+
+    // Two identical 5fps frames encoded as H.264 in an MP4 container.
+    let build = Command::new("ffmpeg")
+        .args(["-v", "error", "-loop", "1", "-framerate", "5", "-i"])
+        .arg(&image)
+        .args(["-frames:v", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    require_success(&build, "ffmpeg input build");
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_video-redact"))
+        .args(["redact", "--input"])
+        .arg(&input)
+        .args(["--output"])
+        .arg(&output_path)
+        .args([
+            "--detector",
+            "yunet",
+            "--inference-backend",
+            "coreml",
+            "--min-confidence",
+            "0.5",
+            "--padding",
+            "8",
+            "--backend",
+            "cpu",
+        ])
+        .arg("--model")
+        .arg(&model)
+        .arg("--ort-library")
+        .arg(&library)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&cli.stdout);
+    require_success(&cli, "video-redact");
+    println!("{stdout}");
+
+    assert!(stdout.contains("coreml"), "{stdout}");
+    assert!(stdout.contains("2 frames"), "{stdout}");
+    let redacted: u64 = stdout
+        .split("regions redacted: ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|value| value.trim().parse().ok())
+        .expect("report must list redacted regions");
+    assert_eq!(redacted, 2, "expected one face per frame in: {stdout}");
+
+    let probed = ffprobe_value(&output_path, "stream=codec_name,width,height");
+    assert!(probed.contains("codec_name=h264"), "{probed}");
+    assert!(probed.contains("width=512"), "{probed}");
+    assert!(probed.contains("height=512"), "{probed}");
+    let frames = run(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ],
+        &[&output_path],
+    );
+    require_success(&frames, "ffprobe frame count");
+    let frame_count = String::from_utf8_lossy(&frames.stdout).trim().to_owned();
+    assert_eq!(frame_count, "2", "probe fields: {probed}");
+
+    // Keep first-frame PNGs of input and output for visual verification.
+    for (video, png) in [(&input, "before.png"), (&output_path, "after.png")] {
+        let extract = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(video)
+            .args(["-frames:v", "1"])
+            .arg(work.join(png))
+            .output()
+            .unwrap();
+        require_success(&extract, "ffmpeg frame extract");
+    }
+    println!("artifacts in {}", work.display());
+}

@@ -7,4 +7,5 @@
 *.ppm
 .DS_Store
 .env
-
+runtime/onnxruntime-*/
+runtime/*.tgz

@@ -22,6 +22,9 @@ REDACT OPTIONS:
     --roi L,T,R,B       Static half-open ROI; may be supplied more than once
     --detector NAME     Detector: static or yunet (default: static)
     --model PATH        YuNet ONNX model path; required by --detector yunet
+    --inference-backend NAME  YuNet inference: cpu or coreml (default: cpu)
+    --ort-library PATH  ONNX Runtime library; required by --inference-backend coreml
+                        (or the VIDEO_REDACT_ORT_DYLIB environment variable)
     --min-confidence F  Confidence needed to redact a detection (default: 0.5)
     --padding N         Pixels added around each detection (default: 0)
     --block-size N      Mosaic block size in pixels (default: 16)
@@ -42,6 +45,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("info") => {
             println!("video-redact {}", env!("CARGO_PKG_VERSION"));
             println!("cuda feature: {}", cfg!(feature = "cuda"));
+            println!("yunet feature: {}", cfg!(feature = "yunet"));
+            println!("coreml feature: {}", cfg!(feature = "coreml"));
             Ok(())
         }
         Some("demo") => {
@@ -66,6 +71,7 @@ fn run_video_redact(args: &[String]) -> Result<(), Box<dyn Error>> {
     // starts, so a bad --model fails before the output is touched.
     let mut detector = build_detector(&parsed)?;
     let mut policy = RedactionPolicy::new(parsed.min_confidence, parsed.padding)?;
+    let inference = inference_label(&parsed);
     let options = PipelineOptions {
         input: parsed.input,
         output: parsed.output,
@@ -81,8 +87,17 @@ fn run_video_redact(args: &[String]) -> Result<(), Box<dyn Error>> {
         other => return Err(format!("unsupported backend `{other}`; use cpu or cuda").into()),
     };
 
-    print_pipeline_report(&options, &report, &parsed.backend);
+    print_pipeline_report(&options, &report, &parsed.backend, &inference);
     Ok(())
+}
+
+/// Human-readable inference engine label for the report; `CoreML` explicitly
+/// notes its compute-units choice and the disabled ORT CPU fallback.
+fn inference_label(parsed: &VideoArgs) -> String {
+    match parsed.inference_backend.as_str() {
+        "coreml" => "coreml (CoreML CPUAndGPU, ORT CPU fallback disabled)".to_owned(),
+        _ => "cpu".to_owned(),
+    }
 }
 
 fn build_detector(parsed: &VideoArgs) -> Result<Box<dyn Detector>, Box<dyn Error>> {
@@ -99,19 +114,78 @@ fn build_yunet_detector(parsed: &VideoArgs) -> Result<Box<dyn Detector>, Box<dyn
         .model
         .as_ref()
         .ok_or("--detector yunet requires --model PATH")?;
-    Ok(Box::new(video_redact_detect::YuNetDetector::new(
+    match parsed.inference_backend.as_str() {
+        "cpu" => Ok(Box::new(video_redact_detect::YuNetDetector::new(
+            model,
+            parsed.min_confidence,
+        )?)),
+        "coreml" => build_coreml_detector(parsed, model),
+        other => Err(format!("unsupported inference backend `{other}`").into()),
+    }
+}
+
+#[cfg(feature = "coreml")]
+fn build_coreml_detector(
+    parsed: &VideoArgs,
+    model: &std::path::Path,
+) -> Result<Box<dyn Detector>, Box<dyn Error>> {
+    let library = resolve_ort_library(
+        parsed.ort_library.as_deref(),
+        env::var_os("VIDEO_REDACT_ORT_DYLIB"),
+    )?;
+    let options = video_redact_detect::CoreMlOptions::new(library);
+    Ok(Box::new(video_redact_detect::YuNetDetector::new_coreml(
         model,
         parsed.min_confidence,
+        &options,
     )?))
+}
+
+#[cfg(all(feature = "yunet", not(feature = "coreml")))]
+fn build_coreml_detector(
+    _parsed: &VideoArgs,
+    _model: &std::path::Path,
+) -> Result<Box<dyn Detector>, Box<dyn Error>> {
+    // Report the missing feature before anything touches runtime files.
+    Err("inference backend `coreml` is unavailable; rebuild with `--features coreml`".into())
 }
 
 #[cfg(not(feature = "yunet"))]
 fn build_yunet_detector(parsed: &VideoArgs) -> Result<Box<dyn Detector>, Box<dyn Error>> {
+    // A `--inference-backend coreml` request reports the missing coreml
+    // feature first; it implies yunet but names the feature actually needed.
+    if parsed.inference_backend == "coreml" {
+        return Err(
+            "inference backend `coreml` is unavailable; rebuild with `--features coreml`".into(),
+        );
+    }
     Err(format!(
         "detector `yunet` is not available (model {:?}); rebuild with `--features yunet`",
         parsed.model
     )
     .into())
+}
+
+/// Resolves the ONNX Runtime library path: `--ort-library` wins, otherwise
+/// `VIDEO_REDACT_ORT_DYLIB`. Takes the env value as a parameter so tests never
+/// touch the process environment.
+#[cfg(any(feature = "coreml", test))]
+fn resolve_ort_library(
+    flag: Option<&std::path::Path>,
+    env_value: Option<std::ffi::OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = flag {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(value) = env_value
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+    Err(
+        "`--inference-backend coreml` requires `--ort-library PATH` or VIDEO_REDACT_ORT_DYLIB"
+            .into(),
+    )
 }
 
 #[derive(Debug)]
@@ -121,6 +195,11 @@ struct VideoArgs {
     regions: Vec<Rect>,
     detector: String,
     model: Option<PathBuf>,
+    inference_backend: String,
+    /// Only read when the `coreml` feature is enabled (or by unit tests);
+    /// parse-time validation uses the pre-struct local.
+    #[allow(dead_code)]
+    ort_library: Option<PathBuf>,
     min_confidence: f32,
     padding: u32,
     block_size: u32,
@@ -128,12 +207,15 @@ struct VideoArgs {
     overwrite: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
     let mut input = None;
     let mut output = None;
     let mut regions = Vec::new();
     let mut detector = String::from("static");
     let mut model = None;
+    let mut inference_backend = String::from("cpu");
+    let mut ort_library = None;
     let mut min_confidence = 0.5_f32;
     let mut padding = 0_u32;
     let mut block_size = 16;
@@ -172,6 +254,19 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
                 index += 1;
                 model = Some(PathBuf::from(
                     args.get(index).ok_or("--model requires a path")?,
+                ));
+            }
+            "--inference-backend" => {
+                index += 1;
+                inference_backend.clone_from(
+                    args.get(index)
+                        .ok_or("--inference-backend requires cpu or coreml")?,
+                );
+            }
+            "--ort-library" => {
+                index += 1;
+                ort_library = Some(PathBuf::from(
+                    args.get(index).ok_or("--ort-library requires a path")?,
                 ));
             }
             "--min-confidence" => {
@@ -214,7 +309,13 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
         index += 1;
     }
 
-    check_detector_args(&detector, model.as_ref(), &regions)?;
+    check_detector_args(
+        &detector,
+        model.as_ref(),
+        &regions,
+        &inference_backend,
+        ort_library.as_ref(),
+    )?;
     match backend.as_str() {
         "cpu" | "cuda" => {}
         other => return Err(format!("unsupported backend `{other}`; use cpu or cuda").into()),
@@ -226,6 +327,8 @@ fn parse_video_args(args: &[String]) -> Result<VideoArgs, Box<dyn Error>> {
         regions,
         detector,
         model,
+        inference_backend,
+        ort_library,
         min_confidence,
         padding,
         block_size,
@@ -238,7 +341,25 @@ fn check_detector_args(
     detector: &str,
     model: Option<&PathBuf>,
     regions: &[Rect],
+    inference_backend: &str,
+    ort_library: Option<&PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
+    match inference_backend {
+        "cpu" => {}
+        "coreml" => {
+            if detector != "yunet" {
+                return Err("--inference-backend coreml requires --detector yunet".into());
+            }
+        }
+        other => {
+            return Err(
+                format!("unsupported inference backend `{other}`; use cpu or coreml").into(),
+            );
+        }
+    }
+    if ort_library.is_some() && inference_backend != "coreml" {
+        return Err("--ort-library is only valid with --inference-backend coreml".into());
+    }
     match detector {
         "static" => {
             if regions.is_empty() {
@@ -278,9 +399,14 @@ fn parse_rect(value: &str) -> Result<Rect, Box<dyn Error>> {
     Ok(Rect::new(*left, *top, *right, *bottom))
 }
 
-fn print_pipeline_report(options: &PipelineOptions, report: &PipelineReport, backend: &str) {
+fn print_pipeline_report(
+    options: &PipelineOptions,
+    report: &PipelineReport,
+    backend: &str,
+    inference: &str,
+) {
     println!(
-        "wrote {}: {} frames, {}x{} @ {} fps, {backend} backend",
+        "wrote {}: {} frames, {}x{} @ {} fps, {backend} backend, {inference} inference",
         options.output.display(),
         report.frames_processed,
         report.video.width,
@@ -616,6 +742,183 @@ mod tests {
             "yunet",
             "--model",
             "/nonexistent/yunet.onnx",
+        ]
+        .map(String::from);
+        let error = run_video_redact(&args).err().unwrap();
+        assert!(error.to_string().contains("model"), "{error}");
+        assert!(!output.exists(), "output must not be created: {error}");
+    }
+
+    #[test]
+    fn inference_backend_defaults_to_cpu() {
+        let args = [
+            "--input", "in.mp4", "--output", "out.mp4", "--roi", "1,2,3,4",
+        ]
+        .map(String::from);
+        let parsed = parse_video_args(&args).unwrap();
+        assert_eq!(parsed.inference_backend, "cpu");
+        assert_eq!(parsed.ort_library, None);
+    }
+
+    #[test]
+    fn parses_yunet_coreml_without_roi() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+            "--model",
+            "model.onnx",
+            "--inference-backend",
+            "coreml",
+            "--ort-library",
+            "libonnxruntime.dylib",
+        ]
+        .map(String::from);
+        let parsed = parse_video_args(&args).unwrap();
+        assert_eq!(parsed.inference_backend, "coreml");
+        assert_eq!(
+            parsed.ort_library.as_deref(),
+            Some(Path::new("libonnxruntime.dylib"))
+        );
+    }
+
+    #[test]
+    fn rejects_coreml_with_static_detector() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--roi",
+            "1,2,3,4",
+            "--inference-backend",
+            "coreml",
+            "--ort-library",
+            "lib.dylib",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(
+            error.to_string().contains("requires --detector yunet"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ort_library_without_coreml() {
+        for extra in [
+            vec!["--roi", "1,2,3,4"],
+            vec!["--detector", "yunet", "--model", "model.onnx"],
+        ] {
+            let args = [
+                "--input",
+                "in.mp4",
+                "--output",
+                "out.mp4",
+                "--ort-library",
+                "lib.dylib",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(String::from)
+            .collect::<Vec<_>>();
+            let error = parse_video_args(&args).unwrap_err();
+            assert!(error.to_string().contains("--ort-library"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_inference_backend() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+            "--model",
+            "model.onnx",
+            "--inference-backend",
+            "opencl",
+        ]
+        .map(String::from);
+        let error = parse_video_args(&args).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported inference backend"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ort_library_resolution_prefers_flag_then_env() {
+        // Flag wins over env; env alone is accepted; neither is an error.
+        let flag = resolve_ort_library(
+            Some(Path::new("/flag/lib.dylib")),
+            Some("/env/lib.dylib".into()),
+        )
+        .unwrap();
+        assert_eq!(flag, Path::new("/flag/lib.dylib"));
+        let env = resolve_ort_library(None, Some("/env/lib.dylib".into())).unwrap();
+        assert_eq!(env, Path::new("/env/lib.dylib"));
+        let error = resolve_ort_library(None, None).unwrap_err();
+        assert!(
+            error.to_string().contains("VIDEO_REDACT_ORT_DYLIB"),
+            "{error}"
+        );
+        // An empty env value counts as unset.
+        assert!(resolve_ort_library(None, Some("".into())).is_err());
+    }
+
+    #[cfg(not(feature = "coreml"))]
+    #[test]
+    fn coreml_inference_reports_missing_feature() {
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            "out.mp4",
+            "--detector",
+            "yunet",
+            "--model",
+            "model.onnx",
+            "--inference-backend",
+            "coreml",
+            "--ort-library",
+            "lib.dylib",
+        ]
+        .map(String::from);
+        let parsed = parse_video_args(&args).unwrap();
+        let error = build_detector(&parsed).err().unwrap();
+        assert!(error.to_string().contains("--features coreml"), "{error}");
+    }
+
+    #[cfg(feature = "coreml")]
+    #[test]
+    fn coreml_missing_model_fails_before_output() {
+        let output = std::env::temp_dir().join(format!(
+            "video-redact-coreml-missing-model-{}-{:?}.mp4",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let args = [
+            "--input",
+            "in.mp4",
+            "--output",
+            output.to_str().unwrap(),
+            "--detector",
+            "yunet",
+            "--model",
+            "/nonexistent/yunet.onnx",
+            "--inference-backend",
+            "coreml",
+            "--ort-library",
+            "/nonexistent/libonnxruntime.dylib",
         ]
         .map(String::from);
         let error = run_video_redact(&args).err().unwrap();

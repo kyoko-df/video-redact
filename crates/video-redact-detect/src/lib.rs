@@ -1,4 +1,5 @@
-//! `YuNet` ONNX face detection on the CPU via `tract`.
+//! `YuNet` ONNX face detection via `tract` on the CPU, or ONNX Runtime's
+//! `CoreML` execution provider on aarch64 macOS (optional `coreml` feature).
 //!
 //! Wraps the `OpenCV` Zoo `face_detection_yunet_2023mar` model behind the
 //! [`Detector`] trait. Every frame is letterboxed onto a fixed 640x640 BGR
@@ -15,7 +16,7 @@
 )]
 
 use std::fmt::{Debug, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tract_onnx::prelude::{
     DatumType, Framework, InferenceModel, InferenceModelExt, TValue, Tensor, TypedModel,
@@ -36,17 +37,53 @@ const NMS_TOP_K: usize = 5000;
 /// Output head kinds in the order each stride consumes them.
 const HEAD_KINDS: [&str; 3] = ["cls", "obj", "bbox"];
 
-/// `YuNet` face detector backed by the `OpenCV` Zoo ONNX model running on
-/// `tract`.
+/// `YuNet` face detector backed by the `OpenCV` Zoo ONNX model.
 ///
-/// The ONNX model is loaded and optimized once at construction; `detect`
-/// reuses the prepared plan for every frame.
+/// The CPU path runs on `tract`; on aarch64 macOS the `coreml` feature adds an
+/// ONNX Runtime + `CoreML` execution-provider engine. The ONNX model and its
+/// runtime are loaded once at construction; `detect` reuses the prepared
+/// engine for every frame.
 pub struct YuNetDetector {
-    plan: TypedSimplePlan<TypedModel>,
-    /// Model output positions for `cls`/`obj`/`bbox` at each stride, so heads
-    /// are found by name rather than by the model's output order.
-    head_outputs: Vec<usize>,
+    engine: Engine,
     min_confidence: f32,
+}
+
+/// Inference engine behind [`YuNetDetector`].
+enum Engine {
+    /// `tract` plan plus the model output positions of the nine `cls`/`obj`/
+    /// `bbox` heads, found by name rather than by output order.
+    Cpu {
+        plan: Box<TypedSimplePlan<TypedModel>>,
+        head_outputs: Vec<usize>,
+    },
+    /// ONNX Runtime session accelerated by the `CoreML` execution provider.
+    #[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+    CoreMl(Box<crate::coreml::CoreMlEngine>),
+}
+
+/// Options for the `CoreML` inference engine used by
+/// [`YuNetDetector::new_coreml`].
+#[derive(Debug, Clone)]
+pub struct CoreMlOptions {
+    /// Path to the ONNX Runtime shared library (`libonnxruntime.dylib`). The
+    /// caller must supply it explicitly; no auto-search or download happens.
+    pub runtime_library: PathBuf,
+    /// ORT profiling file prefix; `None` (default) disables profiling.
+    pub profile_prefix: Option<PathBuf>,
+    /// Verbose ORT session/global logging, including the `CoreML` compute plan.
+    /// Defaults to `false` (warning level).
+    pub verbose: bool,
+}
+
+impl CoreMlOptions {
+    /// Creates options for the given ONNX Runtime library path.
+    pub fn new(runtime_library: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_library: runtime_library.into(),
+            profile_prefix: None,
+            verbose: false,
+        }
+    }
 }
 
 impl Debug for YuNetDetector {
@@ -123,10 +160,79 @@ impl YuNetDetector {
             .into_runnable()
             .map_err(|error| backend(format!("failed to prepare ONNX model: {error}")))?;
         Ok(Self {
-            plan,
-            head_outputs,
+            engine: Engine::Cpu {
+                plan: Box::new(plan),
+                head_outputs,
+            },
             min_confidence,
         })
+    }
+
+    /// Loads the `YuNet` ONNX model on ONNX Runtime with the `CoreML`
+    /// execution provider (aarch64 macOS, `coreml` feature).
+    ///
+    /// The `CoreML` engine keeps the exact letterbox, decode, score and `NMS`
+    /// pipeline of [`YuNetDetector::new`]; only model execution changes. The
+    /// ONNX Runtime library is loaded from `options.runtime_library` only —
+    /// an explicit path, never searched or downloaded. ORT is configured with
+    /// `MLProgram` + `CPUAndGPU` compute units and CPU-EP fallback disabled:
+    /// if `CoreML` cannot take the graph, construction fails instead of
+    /// silently running on CPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedactError::InvalidConfidence`] when `min_confidence` is
+    /// outside `[0.0, 1.0]`, and [`RedactError::Backend`] when the runtime or
+    /// model file is missing/unusable, the model does not expose the expected
+    /// `YuNet` interface, or the `coreml` feature/platform is unavailable.
+    /// There is no fallback to the CPU engine.
+    #[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+    pub fn new_coreml(
+        model_path: impl AsRef<Path>,
+        min_confidence: f32,
+        options: &CoreMlOptions,
+    ) -> Result<Self, RedactError> {
+        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+            return Err(RedactError::InvalidConfidence);
+        }
+        let engine = crate::coreml::build_engine(model_path.as_ref(), options)?;
+        Ok(Self {
+            engine: Engine::CoreMl(Box::new(engine)),
+            min_confidence,
+        })
+    }
+
+    /// CoreML inference is unavailable without the `coreml` feature on
+    /// aarch64 macOS; fails before touching any file or runtime.
+    #[cfg(not(all(feature = "coreml", target_os = "macos", target_arch = "aarch64")))]
+    pub fn new_coreml(
+        _model_path: impl AsRef<Path>,
+        min_confidence: f32,
+        _options: &CoreMlOptions,
+    ) -> Result<Self, RedactError> {
+        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+            return Err(RedactError::InvalidConfidence);
+        }
+        Err(backend(
+            "CoreML inference requires the `coreml` feature on aarch64 macOS; rebuild with `--features coreml`"
+                .to_owned(),
+        ))
+    }
+
+    /// Ends ORT profiling and returns the written profile file.
+    ///
+    /// Returns `Ok(None)` for the CPU engine, when profiling was not enabled,
+    /// or after profiling has already been ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedactError::Backend`] when ending profiling fails.
+    pub fn end_profiling(&mut self) -> Result<Option<PathBuf>, RedactError> {
+        match &mut self.engine {
+            Engine::Cpu { .. } => Ok(None),
+            #[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+            Engine::CoreMl(engine) => engine.end_profiling(),
+        }
     }
 }
 
@@ -136,18 +242,35 @@ impl Detector for YuNetDetector {
         frame: &RgbFrame,
         _frame_index: u64,
     ) -> Result<Vec<Detection>, RedactError> {
+        // Letterbox preprocessing and head decoding/NMS are shared across
+        // engines; only model execution differs.
         let (input, letterbox) = preprocess(frame)?;
-        let tensor = Tensor::from_shape(&[1, 3, INPUT_SIZE, INPUT_SIZE], &input)
-            .map_err(|error| backend(format!("failed to build model input: {error}")))?;
-        let outputs = self
-            .plan
-            .run(tvec![tensor.into()])
-            .map_err(|error| backend(format!("YuNet inference failed: {error}")))?;
-        let heads = extract_heads(&outputs, &self.head_outputs)?;
-        let candidates = decode_heads(&heads, &letterbox, self.min_confidence)?;
+        let candidates = match &mut self.engine {
+            Engine::Cpu { plan, head_outputs } => {
+                let tensor = Tensor::from_shape(&[1, 3, INPUT_SIZE, INPUT_SIZE], &input)
+                    .map_err(|error| backend(format!("failed to build model input: {error}")))?;
+                let outputs = plan
+                    .run(tvec![tensor.into()])
+                    .map_err(|error| backend(format!("YuNet inference failed: {error}")))?;
+                let heads = extract_heads(&outputs, head_outputs)?;
+                decode_heads(&heads, &letterbox, self.min_confidence)?
+            }
+            #[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+            Engine::CoreMl(engine) => {
+                let outputs = engine.infer(input)?;
+                decode_heads(
+                    &crate::coreml::extract_heads(&outputs)?,
+                    &letterbox,
+                    self.min_confidence,
+                )?
+            }
+        };
         Ok(finalize_candidates(candidates, letterbox))
     }
 }
+
+#[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+mod coreml;
 
 fn backend(message: String) -> RedactError {
     RedactError::Backend(message)
@@ -1155,5 +1278,87 @@ mod tests {
         let error = YuNetDetector::new(&path, 0.5).unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(matches!(error, RedactError::Backend(_)), "{error}");
+    }
+
+    #[test]
+    fn coreml_rejects_invalid_confidence() {
+        // Confidence is validated before any runtime/feature check.
+        let options = CoreMlOptions::new("/nonexistent/libonnxruntime.dylib");
+        let error = YuNetDetector::new_coreml("/nonexistent/model.onnx", 1.5, &options)
+            .err()
+            .unwrap();
+        assert!(matches!(error, RedactError::InvalidConfidence), "{error}");
+    }
+
+    #[cfg(not(all(feature = "coreml", target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn coreml_requires_feature_and_platform() {
+        let options = CoreMlOptions::new("/nonexistent/libonnxruntime.dylib");
+        let error = YuNetDetector::new_coreml("/nonexistent/model.onnx", 0.5, &options)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, RedactError::Backend(ref message) if message.contains("coreml")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn coreml_options_default_off() {
+        let options = CoreMlOptions::new("/tmp/libonnxruntime.dylib");
+        assert_eq!(
+            options.runtime_library,
+            Path::new("/tmp/libonnxruntime.dylib")
+        );
+        assert_eq!(options.profile_prefix, None);
+        assert!(!options.verbose);
+    }
+
+    #[cfg(all(feature = "coreml", target_os = "macos", target_arch = "aarch64"))]
+    mod coreml {
+        use super::*;
+
+        #[test]
+        fn new_coreml_missing_files_fail_before_ort() {
+            // Canonicalization must fail before the runtime is ever loaded.
+            let options = CoreMlOptions::new("/nonexistent/libonnxruntime.dylib");
+            let error = YuNetDetector::new_coreml("/nonexistent/model.onnx", 0.5, &options)
+                .err()
+                .unwrap();
+            assert!(
+                matches!(error, RedactError::Backend(ref message) if message.contains("model")),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn new_coreml_rejects_unloadable_runtime() {
+            // Exclusive new files; a dlopen failure must not poison the
+            // process-global runtime registry for a later retry.
+            let dir = std::env::temp_dir().join(format!(
+                "video-redact-coreml-bad-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let model = dir.join("model.onnx");
+            let runtime = dir.join("libonnxruntime.dylib");
+            for path in [&model, &runtime] {
+                let mut file = std::fs::File::create_new(path).unwrap();
+                std::io::Write::write_all(&mut file, b"not a library").unwrap();
+            }
+            let options = CoreMlOptions::new(&runtime);
+            let error = YuNetDetector::new_coreml(&model, 0.5, &options)
+                .err()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                matches!(error, RedactError::Backend(ref message) if message.contains("ONNX Runtime")),
+                "{error}"
+            );
+        }
     }
 }
